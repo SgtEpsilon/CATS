@@ -11,3 +11,4 @@
 
 # Built installer
 /setup/CATSSetup.exe
+build.bat

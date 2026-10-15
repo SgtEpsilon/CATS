@@ -77,6 +77,23 @@ Read this section carefully and follow the instructions, as refuelling needs to 
 * Select the starting point: If you're already at a system on the route, select it here. Otherwise select "Before first system in route".
 * Click "Run CATS", then tab to the Elite Dangerous window. It should now start to plot jumps.
 
+### Refuel safety (Operations)
+Since the Operations update, the home tab of the right-hand panel contains an **Operations** tile, so a stray key
+press while refuelling can open (or join) an Operation instead of the cargo transfer screen. With
+`refuel-safety=true` (the default, in `settings/settings.ini`) CATS now verifies every step of a personal-carrier refuel
+instead of blindly pressing keys:
+* After pressing the panel key it waits for the game (`Status.json`, `GuiFocus`) to confirm the right-hand panel is
+  actually focused.
+* After every tab switch it checks that the panel visibly changed. If it didn't, `space` is never pressed.
+* It watches the journal during the refuel. If the ship undocks, embarks/disembarks, or an Operations-related event
+  appears, CATS stops pressing keys immediately.
+* If something looks wrong it backs out using only `backspace`, retries once, and otherwise stops the route (progress
+  is saved so you can resume) and alerts you, including on Discord if a webhook is set.
+
+Set `refuel-safety=false` to go back to the old blind keypress behaviour. The panel change thresholds
+(`PANEL_REGION`, `PANEL_CHANGE_THRESHOLD`) are at the top of `TraversalSystem/main.py`; the console prints the measured
+value after each tab switch if you need to tune them for an unusual HUD or resolution.
+
 ## Traversal system disclaimer
 Use of programs like this is technically against Frontier's TOS. While they haven't yet banned people for automating carrier jumps, the developer does not take any responsibility for any actions that could be taken against your account.<br>
 Use of the admin interface without the traversal system carries no risk, as it's simply reading from FDev's API.

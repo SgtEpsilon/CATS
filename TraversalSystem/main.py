@@ -31,7 +31,7 @@ import pytz
 import tzlocal
 import psutil
 
-from journalwatcher import JournalWatcher
+from journalwatcher import JournalWatcher, GUI_INTERNAL_PANEL
 from discordhandler import DiscordHandler
 from reshandler import Reshandler
 
@@ -66,6 +66,27 @@ power_saving = False
 global refuel_mode
 refuel_mode = 0
 
+# Refuel safety guards (settings.ini: refuel-safety=true/false). When enabled, every refuel keypress sequence is
+# verified against Status.json, the journal and the on-screen panel so that CATS stops instead of blindly pressing
+# keys in the wrong menu (for example selecting Operations on the right-hand panel's home tab).
+global refuel_safety
+refuel_safety = True
+
+# How many times a refuel is attempted before CATS gives up and stops the route
+MAX_REFUEL_ATTEMPTS = 2
+
+# Region of the screen (fractions of width/height: left, top, right, bottom) watched to confirm that the right-hand
+# panel actually changed after a tab switch, and how much of it has to change (fraction of pixels) to count.
+PANEL_REGION = (0.25, 0.20, 0.90, 0.85)
+PANEL_CHANGE_THRESHOLD = 0.03
+PANEL_PIXEL_DELTA = 24
+
+# Serialises everything that sends keypresses to the game, so a refuel and a jump plot can never interleave
+ui_lock = threading.RLock()
+
+# GuiFocus value of the screen CATS starts on (the carrier services menu), learned at runtime
+baseline_focus = None
+
 # Get the screen resolution
 screen_width, screen_height = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
 
@@ -86,6 +107,7 @@ def load_settings():
     global disable_refuel
     global power_saving
     global refuel_mode
+    global refuel_safety
     # AFAIK, it is impossible to launch the script without either settings file existing
 
     # Get settings from settings.txt
@@ -103,6 +125,7 @@ def load_settings():
                 print(line)
                 journal_directory = os.path.expanduser(line.split("=")[1])
                 latest_journal()  # Check if the journal directory is valid
+                journal_watcher.set_status_file(os.path.join(journal_directory, "Status.json"))
 
             if line.startswith("tritium_slot="):
                 print(line)
@@ -142,6 +165,10 @@ def load_settings():
             if line.startswith("refuel-mode"):
                 print(line)
                 refuel_mode = int(line.split("=")[1].strip())
+
+            if line.startswith("refuel-safety="):
+                print(line)
+                refuel_safety = line.split("=")[1].strip().lower() != "false"
     except Exception as e:
         print("There seems to be a problem with your settings.ini file. Please confirm that your options are properly selected.")
         print(e)
@@ -173,24 +200,225 @@ def slight_random_time(time):
     return random.random() + time
 
 
-def follow_button_sequence(sequence_name):
-    sequence = open("sequences/" + sequence_name, "r", encoding="utf-8").read().split("\n")
+class SequenceAbort(Exception):
+    """Raised when a guarded sequence detects that the game isn't in the state CATS expects.
+    fatal=True means nothing should be retried and no further keys should be pressed."""
 
-    for line in sequence:
-        if line.__contains__(":"):
-            pydirectinput.keyDown(line.split(":")[0])
-            time.sleep(slight_random_time(int(line.split(":")[1])))
-            pydirectinput.keyUp(line.split(":")[0])
+    def __init__(self, message, fatal=False):
+        super().__init__(message)
+        self.fatal = fatal
+
+
+# ---- Guards ----------------------------------------------------------------------------------------------------
+
+def capture_baseline_focus():
+    """Remembers which GuiFocus the game reports on the carrier services menu, so we can tell when we're back.
+    Called at the start of the route and before every refuel (CATS is idling on that menu at those points). A
+    right-hand panel that was left open (GuiFocus 1) is never mistaken for the baseline."""
+    global baseline_focus
+    focus = journal_watcher.gui_focus()
+    if focus is None:
+        print("Could not read Status.json, GuiFocus checks will be skipped.")
+        baseline_focus = None
+    elif focus != GUI_INTERNAL_PANEL:
+        baseline_focus = focus
+        print("Baseline GuiFocus: " + str(focus))
+
+
+def wait_for_focus(expected, timeout=5.0):
+    if expected == "baseline":
+        expected = baseline_focus
+        if expected is None:
+            return  # nothing to compare against
+
+    focus = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        focus = journal_watcher.gui_focus()
+        if focus == expected:
+            return
+        time.sleep(0.25)
+
+    raise SequenceAbort(f"Expected GuiFocus {expected} but the game reports {focus}.")
+
+
+def check_tripwire(marker):
+    unsafe = journal_watcher.unsafe_since(marker)
+    if unsafe:
+        raise SequenceAbort("Unexpected game event during refuel: " + ", ".join(unsafe), fatal=True)
+
+    if journal_watcher.is_docked() is False:
+        raise SequenceAbort("The ship is no longer docked.", fatal=True)
+
+
+def snapshot_panel():
+    try:
+        from PIL import ImageOps
+        left = int(screen_width * PANEL_REGION[0])
+        top = int(screen_height * PANEL_REGION[1])
+        width = int(screen_width * (PANEL_REGION[2] - PANEL_REGION[0]))
+        height = int(screen_height * (PANEL_REGION[3] - PANEL_REGION[1]))
+        image = pyautogui.screenshot(region=(left, top, width, height))
+        return ImageOps.grayscale(image).resize((160, 90))
+    except Exception as e:
+        print("Screen check unavailable: " + str(e))
+        return None
+
+
+def panel_difference(before, after):
+    from PIL import ImageChops
+    histogram = ImageChops.difference(before, after).histogram()
+    changed = sum(histogram[PANEL_PIXEL_DELTA:])
+    return changed / (before.width * before.height)
+
+
+def check_panel_changed(before):
+    """Confirms that the last keypress visibly changed the right-hand panel (i.e. the tab really switched)."""
+    if before is None:
+        return
+
+    diff = 0.0
+    for _ in range(4):
+        time.sleep(0.4)
+        after = snapshot_panel()
+        if after is None:
+            return
+        diff = panel_difference(before, after)
+        print(f"Panel change after keypress: {diff:.3f} (needs {PANEL_CHANGE_THRESHOLD})")
+        if diff >= PANEL_CHANGE_THRESHOLD:
+            return
+
+    raise SequenceAbort("The right-hand panel did not change after a tab switch, refusing to keep pressing keys.")
+
+
+def run_directive(line):
+    parts = line.split()
+    command = parts[0]
+
+    if command == "@focus":
+        value = parts[1]
+        wait_for_focus(value if value == "baseline" else int(value))
+    else:
+        print("Unknown sequence directive ignored: " + line)
+
+
+def safe_backout():
+    """Backs out of whatever menu we're in using only 'backspace' (UI Back), never a select key."""
+    print("Backing out to the carrier services menu...")
+    for _ in range(6):
+        focus = journal_watcher.gui_focus()
+        if baseline_focus is None or focus == baseline_focus:
+            return True
+        pydirectinput.press('backspace')
+        time.sleep(slight_random_time(0.8))
+    return journal_watcher.gui_focus() == baseline_focus
+
+
+def stop_route(reason):
+    """Stops CATS completely, keeping the route position so it can be resumed. Used when it isn't safe to go on."""
+    print("alert:CATS has stopped to protect your carrier and commander. Check the game before resuming.")
+    print("Reason: " + reason)
+    discord_messenger.post_to_discord(
+        "Critical Error",
+        webhook_url,
+        "Carrier Updates: Refuel Safety Stop",
+        "The Flight Computer stopped because the game was not in the expected state.",
+        reason,
+        "Please check the game before resuming navigation.",
+        "o7"
+    )
+    with open("save.txt", "w+", encoding="utf-8") as saveFile:
+        saveFile.write(str(lineNo))
+    print("Progress saved...")
+    os._exit(2)
+
+
+# ---- Sequences -------------------------------------------------------------------------------------------------
+#
+# Sequence file syntax:
+#   key            press the key, then wait 0.1s (plus up to 1s of jitter)
+#   key-N          press the key, then wait N seconds (plus jitter)
+#   key:N          hold the key for N seconds (plus jitter)
+#   # comment      ignored
+#   @focus N       (guarded only) wait until Status.json GuiFocus is N (or 'baseline'), otherwise abort
+#   @changed       (guarded only) the key on the line above must have visibly changed the right-hand panel
+#
+# Lines starting with @ are skipped when refuel safety is off, so sequences behave exactly as they always did.
+
+def press_key(key, guarded=False, marker=0):
+    if guarded:
+        check_tripwire(marker)
+    pydirectinput.press(key)
+
+
+def follow_button_sequence(sequence_name, guarded=False, marker=None):
+    with open("sequences/" + sequence_name, "r", encoding="utf-8") as sequence_file:
+        sequence = [line.strip() for line in sequence_file.read().split("\n")]
+    sequence = [line for line in sequence if line and not line.startswith("#")]
+    before_press = None
+
+    if guarded and marker is None:
+        marker = journal_watcher.mark()
+
+    with ui_lock:
+        for index, line in enumerate(sequence):
+            if line.startswith("@"):
+                if guarded:
+                    if line.startswith("@changed"):
+                        check_panel_changed(before_press)
+                    else:
+                        run_directive(line)
+                continue
+
+            if guarded:
+                check_tripwire(marker)
+                # Only bother taking a screenshot if the next line is going to check it
+                next_line = sequence[index + 1] if index + 1 < len(sequence) else ""
+                before_press = snapshot_panel() if next_line.startswith("@changed") else None
+
+            if ":" in line:
+                key, hold = line.split(":")
+                pydirectinput.keyDown(key)
+                time.sleep(slight_random_time(int(hold)))
+                pydirectinput.keyUp(key)
+            else:
+                wait_time = 0.1
+                key = line
+
+                if "-" in line:
+                    key, wait = line.split("-")
+                    wait_time = int(wait)
+
+                pydirectinput.press(key)
+                time.sleep(slight_random_time(wait_time))
+
+
+def run_restock_steps(guarded):
+    marker = journal_watcher.mark() if guarded else None
+    restock_order = ["restock_fc", "open_cargo_transfer", "restock_cargo"]
+
+    for step in restock_order:
+        if refuel_mode == 2 and os.path.isfile(f"sequences/squadron/{step}.txt"):
+            follow_button_sequence(f"squadron/{step}.txt", guarded, marker)  # follow the button sequence for each step
         else:
-            wait_time = 0.1
-            key = line
+            follow_button_sequence(f"{step}.txt", guarded, marker)
 
-            if line.__contains__("-"):
-                wait_time = int(line.split("-")[1])
-                key = line.split("-")[0]
+        if step == "open_cargo_transfer":
+            # at the end of the cargo transfer step, we need to select the correct trit slot based on user input
+            if refuel_mode == 1:  # Bug fix mode
+                press_key('w', guarded, marker)
+                time.sleep(slight_random_time(0.1))
 
-            pydirectinput.press(key)
-            time.sleep(slight_random_time(wait_time))
+            for _ in range(tritium_slot):
+                if refuel_mode == 2 or refuel_mode == 1:  # Squadron or bug fix mode
+                    press_key('s', guarded, marker)
+                else:  # Regular personal mode
+                    press_key('w', guarded, marker)
+
+                time.sleep(slight_random_time(0.1))
+
+    if guarded:
+        wait_for_focus("baseline")
 
 
 def restock_tritium():
@@ -199,33 +427,49 @@ def restock_tritium():
     if not auto_plot_jumps or disable_refuel:
         # If manual jumping is enabled or automatic refuel is disabled, skip function execution
         return
-    
-    restock_order = ["restock_fc", "open_cargo_transfer", "restock_cargo"]
 
-    for step in restock_order:
-        if refuel_mode == 2 and os.path.isfile(f"sequences/squadron/{step}.txt"):
-            follow_button_sequence(f"squadron/{step}.txt")  # follow the button sequence for each step
-        else:
-            follow_button_sequence(f"{step}.txt")
+    if not refuel_safety:
+        # Legacy behaviour: blind keypresses, no verification
+        with ui_lock:
+            run_restock_steps(False)
+        print("Refuel process completed.")
+        return
 
-        if step == "open_cargo_transfer":
-            # at the end of the cargo transfer step, we need to select the correct trit slot based on user input
-            if refuel_mode == 1: # Bug fix mode
-                pydirectinput.press('w')
-                time.sleep(slight_random_time(0.1))
-            
-            for _ in range(tritium_slot):
-                if refuel_mode == 2 or refuel_mode == 1: # Squadron or bug fix mode
-                    pydirectinput.press('s')
-                else: # Regular personal mode
-                    pydirectinput.press('w')
-               
-                time.sleep(slight_random_time(0.1))
+    with ui_lock:
+        capture_baseline_focus()
 
-    print("Refuel process completed.")
+        for attempt in range(1, MAX_REFUEL_ATTEMPTS + 1):
+            try:
+                # Start from a known place. If a previous attempt left a panel open, close it with backspace only.
+                if baseline_focus is not None and journal_watcher.gui_focus() != baseline_focus:
+                    if not safe_backout():
+                        raise SequenceAbort("Could not get back to the carrier services menu before refuelling.")
+
+                run_restock_steps(True)
+                print("Refuel process completed.")
+                return
+            except SequenceAbort as e:
+                print(f"Refuel attempt {attempt} aborted: {e}")
+
+                if e.fatal:
+                    stop_route(str(e))
+
+                safe_backout()
+
+                if attempt == MAX_REFUEL_ATTEMPTS:
+                    stop_route(f"Refuelling failed {attempt} times. Last problem: {e}")
+
+                print("Retrying refuel shortly...")
+                time.sleep(5)
 
 
 def jump_to_system(system_name):
+    # Never plot a jump while a refuel is still pressing keys (and vice versa)
+    with ui_lock:
+        return _jump_to_system(system_name)
+
+
+def _jump_to_system(system_name):
     global refuel_mode
 
     if not auto_plot_jumps:
@@ -415,6 +659,9 @@ def main_loop():
     for countdown in range(5, 0, -1):
         print(f"Beginning in {countdown}...")
         time.sleep(1)
+
+    # The user is on the carrier services menu at this point (see README), remember what the game calls that screen
+    capture_baseline_focus()
 
     # print("Stocking initial tritium...")
     # restock_tritium()
