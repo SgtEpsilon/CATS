@@ -3,6 +3,8 @@
 /TraversalSystem/pyinstaller/
 /TraversalSystem/main.exe
 
+venv/
+
 # Visual Studio stuff
 /.vs
 
@@ -11,3 +13,4 @@
 
 # Built installer
 /setup/CATSSetup.exe
+build.bat

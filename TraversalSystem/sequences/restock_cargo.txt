@@ -1,3 +1,5 @@
+# Personal carrier: confirm the transfer, then go back to the home tab and close the panel.
+@focus 1
 a:10
 space
 space
@@ -7,3 +9,4 @@ q
 q
 q
 4
+@focus baseline

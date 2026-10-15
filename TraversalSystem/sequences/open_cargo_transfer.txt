@@ -1,9 +1,19 @@
+# Personal carrier: open the right-hand panel and walk to the cargo transfer screen.
+# Everything starting with @ is only checked when refuel safety is on (settings.ini refuel-safety=true).
+# The home tab of this panel contains Operations. Space must never be pressed while still on it, so every tab
+# switch is verified to have changed the panel, and the final select is only sent after a last focus check.
 4
+@focus 1
 e
+@changed
 e
+@changed
 e
+@changed
 e
+@changed
 d
 w
 d
+@focus 1
 space
